@@ -1,0 +1,71 @@
+# region imports
+from AlgorithmImports import *
+import statsmodels.api as sm
+from sklearn.decomposition import PCA
+# endregion
+
+
+class PcaStatArbitrageAlgorithm(QCAlgorithm):
+
+
+    def initialize(self):
+        self.set_start_date(self.end_date - timedelta(5*365))
+        self.set_cash(100000)
+        self.settings.seed_initial_prices = True
+        self.settings.free_portfolio_value_percentage = 0.05
+        self._lookback_days = 60
+        self._pca_components = 3
+        self._entry_z_score = -1.5
+        self.universe_settings.resolution = Resolution.DAILY
+        self.universe_settings.asynchronous = True
+        self._date_rule = self.date_rules.month_start("SPY")
+        self.universe_settings.schedule.on(self._date_rule)
+        # Add universe of top 20 stocks by dollar volume.
+        self._universe = self.add_universe(
+            lambda fundamentals: [
+                f.symbol for f in sorted((f for f in fundamentals if f.price > 5), key=lambda f: f.dollar_volume)[-20:]
+            ]
+        )
+        self.set_warm_up(365)
+
+    def on_warmup_finished(self):
+        # Add a Scheduled event to rebalance the portfolio monthly.
+        time_rule = self.time_rules.at(8, 0)
+        self.schedule.on(self._date_rule, time_rule, self._rebalance)
+        # Rebalance the portfolio today too.
+        if self.live_mode:
+            self._rebalance()
+        else:
+            self.schedule.on(self.date_rules.today, time_rule, self._rebalance)
+
+    def _rebalance(self):
+        # Build targets from the current universe selection.
+        weight_by_symbol = self._compute_weights_by_symbol(self._universe.selected)
+        targets = [PortfolioTarget(symbol, -weight) for symbol, weight in weight_by_symbol.items()]
+        self.set_holdings(targets, True)
+
+    def _compute_weights_by_symbol(self, symbols):
+        if not symbols:
+            return {}
+        history = self.history(symbols, self._lookback_days, Resolution.DAILY).close.unstack(0)
+        # Sample data for PCA (smooth using np.log function).
+        sample = np.log(history.dropna(axis=1))
+        # Center the sample column-wise.
+        sample = sample - sample.mean()
+        # Fit the PCA model.
+        pca_model = PCA().fit(sample)
+        # Get the first n factors from the PCA.
+        factors = np.dot(sample, pca_model.components_.T)[:, :self._pca_components]
+        # Add constants to fit the linear regression (intercept).
+        factors = sm.add_constant(factors)
+        # Train ordinary least squares linear model for each symbol.
+        ols_models = {symbol: sm.OLS(sample[symbol], factors).fit() for symbol in sample.columns}
+        # Get residuals from the linear regression after PCA.
+        residuals = pd.DataFrame({symbol: model.resid for symbol, model in ols_models.items()}, index=sample.index)
+        # Get z-scores of residuals from the most recent day.
+        z_scores = ((residuals - residuals.mean()) / residuals.std()).iloc[-1]
+        # Select stocks far from mean for mean reversion.
+        selected_scores = z_scores[z_scores < self._entry_z_score]
+        denominator = selected_scores.abs().sum()
+        # Return weights for each selected stock.
+        return selected_scores * (1 / denominator)
