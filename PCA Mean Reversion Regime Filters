@@ -1,0 +1,43 @@
+#VIX-based filter
+self._vix = self.add_data(CBOE, "VIX")
+# In _rebalance():
+if self.securities[self._vix.symbol].price < 20:
+    return  # Don't short in calm markets
+
+#SPY 200-day moving average
+self._spy = self.add_equity("SPY")
+self._sma200 = self.sma("SPY", 200, Resolution.DAILY)
+# In _rebalance():
+if self._sma200.is_ready and self.securities["SPY"].price > self._sma200.current.value:
+    return  # Market in uptrend, skip shorts
+
+#Hidden Markov Model
+from hmmlearn.hmm import GaussianHMM
+
+def _detect_regime(self):
+    spy_history = self.history["SPY", 252, Resolution.DAILY].close.pct_change().dropna()
+    model = GaussianHMM(n_components=2, covariance_type="full", n_iter=100)
+    model.fit(spy_history.values.reshape(-1, 1))
+    current_regime = model.predict(spy_history.values.reshape(-1, 1))[-1]
+    # Regime with higher variance = risk-off
+    high_vol_state = np.argmax([model.covars_[0], model.covars_[1]])
+    return current_regime == high_vol_state
+
+#combine vix and spy
+def _in_short_regime(self):
+    vix_bearish = self.securities[self._vix.symbol].price > 20
+    spy_bearish = self.securities["SPY"].price < self._sma200.current.value
+    signals = [vix_bearish, spy_bearish]
+    return sum(signals) >= 2  # Majority vote
+
+#flipping to long on regime switch
+def _rebalance(self):
+    weight_by_symbol = self._compute_weights_by_symbol(self._universe.selected)
+    if self._in_short_regime():
+        # Short the weak stocks
+        targets = [PortfolioTarget(symbol, -weight) for symbol, weight in weight_by_symbol.items()]
+    else:
+        # Flip to long the same stocks on regime switch
+        targets = [PortfolioTarget(symbol, weight) for symbol, weight in weight_by_symbol.items()]
+    self.set_holdings(targets, True)
+
