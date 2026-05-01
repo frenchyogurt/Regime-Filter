@@ -1,0 +1,55 @@
+#VIX-based filter
+self._vix = self.add_data(CBOE, "VIX")
+# In _rebalance():
+if self.securities[self._vix.symbol].price > 20:
+    return  # Too volatile, mean reversion unreliable
+
+#SPY 200-day moving average (most important filter)
+self._spy = self.add_equity("SPY")
+self._sma200 = self.sma("SPY", 200, Resolution.DAILY)
+# In _rebalance():
+if self._sma200.is_ready and self.securities["SPY"].price < self._sma200.current.value:
+    return  # Downtrend, skip longs
+
+#SPY short term momentum
+self._roc10 = self.roc("SPY", 10, Resolution.DAILY)
+# In _rebalance():
+if self._roc10.is_ready and self._roc10.current.value < -0.03:
+    return  # Market dropping short-term, wait for stabilization
+
+#Hidden Markov Model
+from hmmlearn.hmm import GaussianHMM
+def _detect_regime(self):
+    spy_history = self.history["SPY", 252, Resolution.DAILY].close.pct_change().dropna()
+    model = GaussianHMM(n_components=2, covariance_type="full", n_iter=100)
+    model.fit(spy_history.values.reshape(-1, 1))
+    current_regime = model.predict(spy_history.values.reshape(-1, 1))[-1]
+    # Low variance state = risk-on = run strategy
+    low_vol_state = np.argmin([model.covars_[0][0][0], model.covars_[1][0][0]])
+    return current_regime == low_vol_state
+
+#combined filter
+def _in_mean_reversion_regime(self):
+    vix_calm = self.securities[self._vix.symbol].price < 20
+    spy_uptrend = (
+        self._sma200.is_ready and 
+        self.securities["SPY"].price > self._sma200.current.value
+    )
+    spy_stable = (
+        self._roc10.is_ready and 
+        self._roc10.current.value > -0.03
+    )
+    hmm_low_vol = self._detect_regime()
+    
+    signals = [vix_calm, spy_uptrend, spy_stable, hmm_low_vol]
+    return sum(signals) >= 3  # Require 3 out of 4 to agree
+
+#flipping to long on regime switch
+def _rebalance(self):
+    if not self._in_mean_reversion_regime():
+        self.liquidate()  # Exit all positions in bad regime
+        return
+    
+    weight_by_symbol = self._compute_weights_by_symbol(self._universe.selected)
+    targets = [PortfolioTarget(symbol, -weight) for symbol, weight in weight_by_symbol.items()]
+    self.set_holdings(targets, True)
