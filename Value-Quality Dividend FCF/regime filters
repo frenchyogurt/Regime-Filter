@@ -1,0 +1,75 @@
+#200 day SPY SMA
+# Add to initialize():
+self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
+self._sma200 = self.SMA(self.spy, 200, Resolution.DAILY)
+
+# Replace _select_assets return with:
+def _select_assets(self, fundamentals):
+    # Regime check: only trade above the 200-day SMA
+    if not self._sma200.is_ready:
+        return []
+    spy_price = self.securities[self.spy].price
+    if spy_price < self._sma200.current.value:
+        self.log("Regime: SPY below 200 SMA — cash")
+        return []
+
+    # ... rest of existing selection logic unchanged ...
+    filtered = [f for f in fundamentals if f.has_fundamental_data]
+    # etc.
+
+
+#vix gate
+# Add to initialize():
+self._vix = self.add_data(
+    CBOE, "VIX", Resolution.DAILY
+).symbol
+self._vix_threshold = 25
+
+# Add to _select_assets(), before factor ranking:
+def _select_assets(self, fundamentals):
+    # Regime check: avoid high-volatility environments
+    vix_data = self.current_slice.get(CBOE, self._vix)
+    if vix_data is not None:
+        if vix_data.value > self._vix_threshold:
+            self.log(
+                f"Regime: VIX={vix_data.value:.1f} > threshold — cash"
+            )
+            return []
+
+    # ... existing selection logic ...
+
+
+
+
+#credit spread gate
+# Add to initialize():
+self._hyg = self.add_equity("HYG", Resolution.DAILY).symbol
+self._ief = self.add_equity("IEF", Resolution.DAILY).symbol
+# Track rolling ratio with a RollingWindow
+self._ratio_window = RollingWindow[float](50)
+self.schedule.on(
+    self.date_rules.every_day("HYG"),
+    self.time_rules.after_market_open("HYG", 1),
+    self._update_credit_ratio
+)
+
+def _update_credit_ratio(self):
+    hyg = self.securities[self._hyg].price
+    ief = self.securities[self._ief].price
+    if hyg > 0 and ief > 0:
+        self._ratio_window.add(hyg / ief)
+
+def _credit_regime_ok(self) -> bool:
+    if not self._ratio_window.is_ready:
+        return True  # warm-up: allow trading
+    ratio_50_avg = np.mean([self._ratio_window[i]
+                            for i in range(50)])
+    current_ratio = self._ratio_window[0]
+    return current_ratio >= ratio_50_avg
+
+# In _select_assets():
+def _select_assets(self, fundamentals):
+    if not self._credit_regime_ok():
+        self.log("Regime: HYG/IEF ratio below 50d avg — cash")
+        return []
+    # ... existing selection logic ...
