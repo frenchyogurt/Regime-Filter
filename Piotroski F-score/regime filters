@@ -1,0 +1,370 @@
+#SPY 200 day moving average
+from AlgorithmImports import *
+from datetime import timedelta
+
+
+class TrendGatedAlphaModel(AlphaModel):
+    """
+    Regime Filter 1 — 200-day SMA trend gate.
+    Emits UP insights only when SPY is trading above its 200-day SMA.
+    When SPY is below the SMA, returns an empty list (go to cash).
+    """
+
+    def __init__(self, algo: QCAlgorithm):
+        self.algo = algo
+
+    def update(self, algo: QCAlgorithm, data: Slice) -> list:
+        if not self.algo.sma200.IsReady:
+            return []
+
+        spy_price = algo.Securities[self.algo.spy].Price
+
+        # Risk-off: SPY below 200-day SMA — no longs, stay in cash
+        if spy_price < self.algo.sma200.Current.Value:
+            algo.Log(f"SMA filter: SPY {spy_price:.2f} < SMA200 {self.algo.sma200.Current.Value:.2f} — risk-off")
+            return []
+
+        # Risk-on: emit UP insight for every active security
+        insights = []
+        for symbol in algo.ActiveSecurities.Keys:
+            if symbol == self.algo.spy:
+                continue
+            insights.append(
+                Insight.Price(symbol, timedelta(30), InsightDirection.UP)
+            )
+        return insights
+
+
+class PiotroskiWithSMAFilter(QCAlgorithm):
+    def initialize(self):
+        self.set_cash(10_000_000)
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+
+        # Add SPY for the regime filter
+        self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
+        self.sma200 = self.SMA(self.spy, 200, Resolution.DAILY)
+
+        rebalance_date = self.date_rules.month_start("SPY")
+
+        self.universe_settings.schedule.on(rebalance_date)
+        self.universe_settings.resolution = Resolution.HOUR
+        self.settings.rebalance_portfolio_on_insight_changes = False
+
+        self.add_universe_selection(
+            PiotroskiScoreUniverseSelectionModel(
+                self,
+                self.get_parameter("score_threshold", 8),
+                self.get_parameter("max_universe_size", 100),
+            )
+        )
+
+        # Swap ConstantAlphaModel for the trend-gated version
+        self.add_alpha(TrendGatedAlphaModel(self))
+
+        self.set_portfolio_construction(
+            EqualWeightingPortfolioConstructionModel(rebalance_date)
+        )
+        self.set_execution(SpreadExecutionModel(0.01))
+        self.set_warm_up(timedelta(3 * 365))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#vix gate
+from AlgorithmImports import *
+from datetime import timedelta
+
+
+class PiotroskiWithVIXFilter(QCAlgorithm):
+    """
+    Regime Filter 2 — VIX volatility gate.
+    Liquidates all positions when the VIX spikes above a threshold (default 25).
+    Re-enters on the next monthly rebalance if VIX has normalised.
+    """
+
+    def initialize(self):
+        self.set_cash(10_000_000)
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+
+        # VIX data feed
+        self.vix = self.add_data(CBOE, "VIX", Resolution.DAILY).symbol
+        self.vix_threshold = self.get_parameter("vix_threshold", 25)
+
+        rebalance_date = self.date_rules.month_start("SPY")
+
+        self.universe_settings.schedule.on(rebalance_date)
+        self.universe_settings.resolution = Resolution.HOUR
+        self.settings.rebalance_portfolio_on_insight_changes = False
+
+        self.add_universe_selection(
+            PiotroskiScoreUniverseSelectionModel(
+                self,
+                self.get_parameter("score_threshold", 8),
+                self.get_parameter("max_universe_size", 100),
+            )
+        )
+
+        self.add_alpha(ConstantAlphaModel(InsightType.PRICE, InsightDirection.UP, timedelta(30)))
+        self.set_portfolio_construction(
+            EqualWeightingPortfolioConstructionModel(rebalance_date)
+        )
+        self.set_execution(SpreadExecutionModel(0.01))
+        self.set_warm_up(timedelta(3 * 365))
+
+    def on_data(self, data: Slice):
+        # Check VIX on every daily bar
+        if not data.ContainsKey(self.vix):
+            return
+
+        vix_val = data[self.vix].Value
+
+        if vix_val > self.vix_threshold:
+            # Risk-off: volatility spike — liquidate all longs, move to cash
+            if self.invested:
+                self.liquidate()
+                self.log(f"VIX filter: VIX={vix_val:.1f} > {self.vix_threshold} — liquidated, risk-off")
+
+
+
+
+
+
+
+
+
+
+
+#credit spread
+from AlgorithmImports import *
+from datetime import timedelta
+
+
+class CreditGatedAlphaModel(AlphaModel):
+    """
+    Regime Filter 3 — Credit spread gate (HYG vs IEF).
+    Uses 63-day (≈3-month) rate-of-change to compare high-yield credit (HYG)
+    against intermediate Treasuries (IEF).
+
+    Risk-on  : HYG outperforming IEF → credit spreads tightening → safe to hold longs.
+    Risk-off : IEF outperforming HYG → credit stress rising → go to cash.
+
+    Why this matters for Piotroski:
+    When credit stress is high, fundamentally weak companies can't refinance — value
+    stocks become value traps and the F-Score's accounting signals lose predictive power.
+    """
+
+    def __init__(self, algo: QCAlgorithm):
+        self.algo = algo
+
+    def is_credit_risk_on(self) -> bool:
+        if not (self.algo.hyg_roc.IsReady and self.algo.ief_roc.IsReady):
+            return True  # Default to risk-on during warm-up
+        return self.algo.hyg_roc.Current.Value > self.algo.ief_roc.Current.Value
+
+    def update(self, algo: QCAlgorithm, data: Slice) -> list:
+        if not self.is_credit_risk_on():
+            algo.Log(
+                f"Credit filter: HYG ROC={self.algo.hyg_roc.Current.Value:.4f} "
+                f"< IEF ROC={self.algo.ief_roc.Current.Value:.4f} — risk-off"
+            )
+            return []
+
+        insights = []
+        for symbol in algo.ActiveSecurities.Keys:
+            if symbol in (self.algo.hyg, self.algo.ief):
+                continue
+            insights.append(
+                Insight.Price(symbol, timedelta(30), InsightDirection.UP)
+            )
+        return insights
+
+
+class PiotroskiWithCreditFilter(QCAlgorithm):
+    def initialize(self):
+        self.set_cash(10_000_000)
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+
+        # Credit regime instruments
+        self.hyg = self.add_equity("HYG", Resolution.DAILY).symbol  # High-yield credit ETF
+        self.ief = self.add_equity("IEF", Resolution.DAILY).symbol  # 7-10yr Treasury ETF
+
+        # 63-day (≈3-month) rate of change for each
+        self.hyg_roc = self.ROC(self.hyg, 63, Resolution.DAILY)
+        self.ief_roc = self.ROC(self.ief, 63, Resolution.DAILY)
+
+        rebalance_date = self.date_rules.month_start("SPY")
+
+        self.universe_settings.schedule.on(rebalance_date)
+        self.universe_settings.resolution = Resolution.HOUR
+        self.settings.rebalance_portfolio_on_insight_changes = False
+
+        self.add_universe_selection(
+            PiotroskiScoreUniverseSelectionModel(
+                self,
+                self.get_parameter("score_threshold", 8),
+                self.get_parameter("max_universe_size", 100),
+            )
+        )
+
+        self.add_alpha(CreditGatedAlphaModel(self))
+
+        self.set_portfolio_construction(
+            EqualWeightingPortfolioConstructionModel(rebalance_date)
+        )
+        self.set_execution(SpreadExecutionModel(0.01))
+        self.set_warm_up(timedelta(3 * 365))
+
+
+
+
+
+
+
+
+
+
+
+
+
+#combined
+from AlgorithmImports import *
+from datetime import timedelta
+
+
+class RegimeGatedAlphaModel(AlphaModel):
+    """
+    Combined regime filter for Piotroski F-Score strategy.
+
+    Three gates — ALL must be green to emit longs:
+      1. SMA trend     : SPY price > SPY 200-day SMA
+      2. VIX volatility: VIX < vix_threshold (default 25)
+      3. Credit spread : HYG 63-day ROC > IEF 63-day ROC (credit risk-on)
+
+    If any gate is red → return empty list → portfolio construction goes to cash.
+    """
+
+    def __init__(self, algo: QCAlgorithm):
+        self.algo = algo
+
+    # ------------------------------------------------------------------ #
+    # Gate helpers
+    # ------------------------------------------------------------------ #
+
+    def _sma_risk_on(self) -> tuple[bool, str]:
+        if not self.algo.sma200.IsReady:
+            return True, "SMA not ready"
+        spy_price = self.algo.Securities[self.algo.spy].Price
+        ok = spy_price > self.algo.sma200.Current.Value
+        return ok, f"SPY {spy_price:.2f} vs SMA200 {self.algo.sma200.Current.Value:.2f}"
+
+    def _vix_risk_on(self) -> tuple[bool, str]:
+        vix_val = self.algo.current_vix
+        if vix_val is None:
+            return True, "VIX not ready"
+        ok = vix_val < self.algo.vix_threshold
+        return ok, f"VIX {vix_val:.1f} vs threshold {self.algo.vix_threshold}"
+
+    def _credit_risk_on(self) -> tuple[bool, str]:
+        if not (self.algo.hyg_roc.IsReady and self.algo.ief_roc.IsReady):
+            return True, "Credit ROC not ready"
+        hyg = self.algo.hyg_roc.Current.Value
+        ief = self.algo.ief_roc.Current.Value
+        ok = hyg > ief
+        return ok, f"HYG ROC {hyg:.4f} vs IEF ROC {ief:.4f}"
+
+    # ------------------------------------------------------------------ #
+    # AlphaModel interface
+    # ------------------------------------------------------------------ #
+
+    def update(self, algo: QCAlgorithm, data: Slice) -> list:
+        sma_ok, sma_msg = self._sma_risk_on()
+        vix_ok, vix_msg = self._vix_risk_on()
+        crd_ok, crd_msg = self._credit_risk_on()
+
+        if not (sma_ok and vix_ok and crd_ok):
+            algo.Log(
+                f"Regime OFF — SMA: {sma_msg} | VIX: {vix_msg} | Credit: {crd_msg}"
+            )
+            return []  # All gates must pass; go to cash
+
+        insights = []
+        skip = {self.algo.spy, self.algo.hyg, self.algo.ief}
+        for symbol in algo.ActiveSecurities.Keys:
+            if symbol in skip:
+                continue
+            insights.append(
+                Insight.Price(symbol, timedelta(30), InsightDirection.UP)
+            )
+        return insights
+
+
+class PiotroskiWithAllFilters(QCAlgorithm):
+    """
+    Piotroski F-Score long-only strategy with three regime filters combined.
+
+    Parameters (set via QC parameter panel or get_parameter):
+      score_threshold   : int   = 8    — minimum Piotroski score to enter universe
+      max_universe_size : int   = 100  — max stocks in universe
+      vix_threshold     : float = 25   — liquidate when VIX exceeds this level
+    """
+
+    def initialize(self):
+        self.set_cash(10_000_000)
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+
+        # ---- Regime filter instruments -------------------------------- #
+
+        # Filter 1: 200-day SMA on SPY
+        self.spy = self.add_equity("SPY", Resolution.DAILY).symbol
+        self.sma200 = self.SMA(self.spy, 200, Resolution.DAILY)
+
+        # Filter 2: VIX level (stored as instance var so on_data can update it)
+        self.vix_symbol = self.add_data(CBOE, "VIX", Resolution.DAILY).symbol
+        self.vix_threshold = self.get_parameter("vix_threshold", 25)
+        self.current_vix = None  # Updated in on_data
+
+        # Filter 3: HYG vs IEF credit spread proxy
+        self.hyg = self.add_equity("HYG", Resolution.DAILY).symbol
+        self.ief = self.add_equity("IEF", Resolution.DAILY).symbol
+        self.hyg_roc = self.ROC(self.hyg, 63, Resolution.DAILY)
+        self.ief_roc = self.ROC(self.ief, 63, Resolution.DAILY)
+
+        # ---- Universe & strategy ------------------------------------- #
+
+        rebalance_date = self.date_rules.month_start("SPY")
+
+        self.universe_settings.schedule.on(rebalance_date)
+        self.universe_settings.resolution = Resolution.HOUR
+        self.settings.rebalance_portfolio_on_insight_changes = False
+
+        self.add_universe_selection(
+            PiotroskiScoreUniverseSelectionModel(
+                self,
+                self.get_parameter("score_threshold", 8),
+                self.get_parameter("max_universe_size", 100),
+            )
+        )
+
+        self.add_alpha(RegimeGatedAlphaModel(self))
+
+        self.set_portfolio_construction(
+            EqualWeightingPortfolioConstructionModel(rebalance_date)
+        )
+        self.set_execution(SpreadExecutionModel(0.01))
+        self.set_warm_up(timedelta(3 * 365))
+
+    def on_data(self, data: Slice):
+        # Keep current VIX value fresh for the alpha model
+        if data.ContainsKey(self.vix_symbol):
+            self.current_vix = data[self.vix_symbol].Value
