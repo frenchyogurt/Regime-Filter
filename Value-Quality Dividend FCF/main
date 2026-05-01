@@ -1,0 +1,55 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+
+class StockSelectionStrategyBasedOnFundamentalFactorsAlgorithm(QCAlgorithm):
+
+    def initialize(self):
+        self.set_start_date(self.end_date - timedelta(5*365))
+        self.set_cash(100_000)
+        # Define some parameters.
+        self._liquidity_filter_size = 300
+        self._universe_size = 10
+        # Add a universe of US Equities.
+        date_rule = self.date_rules.month_start('SPY')
+        self.universe_settings.schedule.on(date_rule)
+        self.add_universe(self._select_assets)
+        # Add the Alpha and Portfolio Construction models.
+        self.set_alpha(ConstantAlphaModel(InsightType.PRICE, InsightDirection.UP, timedelta(30)))
+        self.settings.rebalance_portfolio_on_security_changes = False
+        self.settings.rebalance_portfolio_on_insight_changes = False
+        self.set_portfolio_construction(EqualWeightingPortfolioConstructionModel(date_rule))
+        # Add a warm-up period so the algorithm trades on deployment.
+        self.set_warm_up(timedelta(45))
+
+    def _select_assets(self, fundamentals):
+        # Select the most liquid stocks.
+        filtered = [f for f in fundamentals if f.has_fundamental_data]
+        filtered = sorted(filtered, key=lambda f: f.dollar_volume)[-self._liquidity_filter_size:]
+        # Rank the stocks by the following fundamental factors:
+        filtered = [
+            f for f in filtered 
+            if not any([np.isnan(factor) for factor in [
+                f.earning_reports.total_dividend_per_share.three_months,
+                f.valuation_ratios.price_change_1m,
+                f.valuation_ratios.book_value_per_share,
+                f.valuation_ratios.fcf_yield
+            ]])
+        ]
+        sorted_by_factor1 = sorted(filtered, key=lambda f: f.earning_reports.total_dividend_per_share.three_months, reverse=True)
+        sorted_by_factor2 = sorted(filtered, key=lambda f: f.valuation_ratios.price_change_1m, reverse=False)
+        sorted_by_factor3 = sorted(filtered, key=lambda f: f.valuation_ratios.book_value_per_share, reverse=True)
+        sorted_by_factor4 = sorted(filtered, key=lambda f: f.valuation_ratios.fcf_yield, reverse=True)
+        score_by_symbol = {
+            f.symbol: sum([
+                rank1,
+                sorted_by_factor2.index(f),
+                sorted_by_factor3.index(f),
+                sorted_by_factor4.index(f)
+            ])
+            for rank1, f in enumerate(sorted_by_factor1)    
+        }
+        # Select the subset of stocks with the best rankings.
+        return sorted(score_by_symbol, key=lambda symbol: score_by_symbol[symbol])[-self._universe_size:]
+        
