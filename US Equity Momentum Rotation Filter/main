@@ -1,0 +1,45 @@
+# region imports
+from AlgorithmImports import *
+from alpha import MomentumAlphaModel
+from risk import RiskModelWithSPY
+# endregion
+
+
+class MomentumFrameworkAlgo(QCAlgorithm):
+
+    def initialize(self) -> None:
+        self.set_start_date(self.end_date - timedelta(5*365))
+        self.set_cash(100_000)
+        self.settings.automatic_indicator_warm_up = True
+        self.settings.seed_initial_prices = True
+        self.universe_settings.resolution = Resolution.HOUR
+        self.set_brokerage_model(BrokerageName.INTERACTIVE_BROKERS_BROKERAGE, AccountType.MARGIN)
+        spy = self.add_equity("SPY")
+        self.set_benchmark(spy)
+        universe_size = 20
+        # Use a monthly universe schedule anchored to the US equity calendar.
+        date_rule = self.date_rules.month_start(spy)
+        self.universe_settings.schedule.on(date_rule)
+        self.universe_settings.asynchronous = True
+        self.add_universe_selection(
+            FundamentalUniverseSelectionModel(
+                # Sort by the highest dollar-volume symbols after filtering by price.
+                lambda fundamental: [
+                    x.symbol
+                    for x in sorted(
+                        [x for x in fundamental if x.has_fundamental_data and x.price > 10],
+                        key=lambda x: x.dollar_volume,
+                    )[-universe_size:]
+                ]
+            )
+        )
+        # Emit monthly momentum insights based on rolling ROC values.
+        self.add_alpha(
+            MomentumAlphaModel(self, date_rule, 60, Resolution.DAILY, 10)
+        )
+        self.set_portfolio_construction(
+            EqualWeightingPortfolioConstructionModel(Expiry.END_OF_MONTH, PortfolioBias.LONG)
+        )
+        self.add_risk_management(
+            RiskModelWithSPY(self, spy, 200, Resolution.DAILY)
+        )
