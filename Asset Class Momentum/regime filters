@@ -1,0 +1,81 @@
+#own 200 day simple moving average
+def initialize(self):
+    ...
+    for ticker in tickers:
+        eq = self.add_equity(ticker, Resolution.DAILY)
+        eq.momp = self.momp(eq.symbol, 252, Resolution.DAILY)
+        eq.sma200 = self.sma(eq.symbol, 200, Resolution.DAILY)
+
+def on_data(self, slice):
+    # Only rank ETFs above their 200-day SMA
+    eligible = [s for s in self.securities.values()
+                if s.sma200.is_ready and
+                   s.price > s.sma200.current.value]
+    if len(eligible) == 0:
+        self.liquidate(); return
+    top_n = min(3, len(eligible))
+    to_long = [x.symbol for x in
+               sorted(eligible, key=lambda s: s.momp)[-top_n:]]
+    targets = [PortfolioTarget(s, 1/top_n) for s in to_long]
+    self.set_holdings(targets, liquidate_existing_holdings=True)
+
+
+
+
+#vix gate
+def initialize(self):
+    ...
+    self.vix = self.add_data(CBOE, "VIX", Resolution.DAILY)
+
+def on_data(self, slice):
+    if self.vix.symbol in slice and \
+       slice[self.vix.symbol].value > 25:
+        # High fear regime — go to cash
+        self.liquidate()
+        return
+    # Normal regime — run momentum as usual
+    to_long = [x.symbol for x in
+        sorted(self.securities.values(),
+               key=lambda s: s.momp)[-3:]]
+    targets = [PortfolioTarget(s, 1/3) for s in to_long]
+    self.set_holdings(targets, liquidate_existing_holdings=True)
+
+
+
+
+#positive momentum only filter
+def on_data(self, slice):
+    ranked = sorted(self.securities.values(),
+                    key=lambda s: s.momp)
+    # Filter: only positive momentum ETFs
+    positive = [x for x in ranked
+                if x.momp.current.value > 0]
+    if len(positive) == 0:
+        self.liquidate(); return
+    top_n = min(3, len(positive))
+    to_long = [x.symbol for x in positive[-top_n:]]
+    wt = 1 / top_n
+    targets = [PortfolioTarget(s, wt) for s in to_long]
+    self.set_holdings(targets, liquidate_existing_holdings=True)
+
+
+
+#yield curve recession filter
+def initialize(self):
+    ...
+    # Fetch 10Y and 2Y yield spread via FRED
+    self.t10y2y = self.add_data(
+        Fred, Fred.T10Y2Y, Resolution.DAILY)
+
+def on_data(self, slice):
+    if self.t10y2y.symbol in slice:
+        spread = slice[self.t10y2y.symbol].value
+        if spread < 0:  # inverted
+            self.set_holdings("BND", 1.0)
+            return
+    # Normal regime — standard momentum logic
+    to_long = [x.symbol for x in
+        sorted(self.securities.values(),
+               key=lambda s: s.momp)[-3:]]
+    targets = [PortfolioTarget(s, 1/3) for s in to_long]
+    self.set_holdings(targets, liquidate_existing_holdings=True)
