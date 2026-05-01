@@ -1,0 +1,40 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+
+class MomentumAlphaModel(AlphaModel):
+
+    def __init__(self, algorithm, date_rule, lookback, resolution, num_insights):
+        self._lookback = lookback
+        self._resolution = resolution
+        self._num_insights = num_insights
+        self._securities = []
+        self._insights = []
+        # Schedule monthly alpha emission at 8:00 for daily equity workflows.
+        algorithm.schedule.on(date_rule, algorithm.time_rules.at(8, 0), self._create_insights)
+
+    def _create_insights(self):
+        insights = []
+        for security in self._securities:
+            if not security.roc.is_ready:
+                continue
+            magnitude = security.roc.current.value
+            if magnitude < 0:
+                continue
+            insights.append(Insight.price(security, Expiry.END_OF_MONTH, InsightDirection.UP, magnitude))
+        # Keep only the strongest monthly signals by ROC magnitude.
+        self._insights = sorted(insights, key=lambda i: i.magnitude)[-self._num_insights:]
+
+    def update(self, algorithm, data):
+        insights = self._insights.copy()
+        self._insights.clear()
+        return insights
+
+    def on_securities_changed(self, algorithm, changes):
+        for security in changes.removed_securities:
+            if security in self._securities:
+                self._securities.remove(security)
+        for security in changes.added_securities:
+            security.roc = algorithm.roc(security, self._lookback, self._resolution)
+            self._securities.append(security)
