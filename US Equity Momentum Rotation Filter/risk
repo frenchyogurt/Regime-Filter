@@ -1,0 +1,21 @@
+# region imports
+from AlgorithmImports import *
+# endregion
+
+
+class RiskModelWithSPY(RiskManagementModel):
+
+    def __init__(self, algorithm, spy, lookback, resolution):
+        self._spy = spy
+        self._ema = algorithm.ema(spy, lookback, resolution)
+
+    def manage_risk(self, algorithm, targets):
+        # Liquidate invested assets when SPY falls below its EMA filter.       
+        if not self._ema.is_ready or self._spy.price > self._ema.current.value:
+            return []
+        targets = [PortfolioTarget(security, 0) for security in algorithm.active_securities.values()]
+        # Cancel insights to prevent the PCM from re-entering liquidated positions.
+        algorithm.insights.cancel([t.symbol for t in targets])
+        return targets
+
+                        
