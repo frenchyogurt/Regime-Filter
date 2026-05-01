@@ -1,0 +1,12 @@
+# QuantBook Analysis Tool
+# For more information see https://www.quantconnect.com/docs/research/overview
+qb = QuantBook()
+import numpy as np
+import pandas as pd
+
+backtest = api.ReadBacktest(10000763, '742970cc755cf94233cff4683065e2de')
+print(backtest.Created)
+
+
+
+backtest.TotalPerformance.PortfolioStatistics
