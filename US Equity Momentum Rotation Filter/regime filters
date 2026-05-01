@@ -1,0 +1,67 @@
+#ema fast/slow crossover
+class DualEMARiskModel(RiskManagementModel):
+    def __init__(self, algorithm, spy, fast=50, slow=200,
+                 resolution=Resolution.DAILY):
+        self._spy      = spy
+        self._ema_fast = algorithm.ema(spy, fast, resolution)
+        self._ema_slow = algorithm.ema(spy, slow, resolution)
+
+    def manage_risk(self, algorithm, targets):
+        if not (self._ema_fast.is_ready and self._ema_slow.is_ready):
+            return []
+        price     = self._spy.price
+        above_slow = price > self._ema_slow.current.value
+        above_fast = price > self._ema_fast.current.value
+        if above_slow or above_fast:  # either condition = stay in
+            return []
+        # both broken → liquidate
+        targets = [PortfolioTarget(s, 0)
+                   for s in algorithm.active_securities.values()]
+        algorithm.insights.cancel([t.symbol for t in targets])
+        return targets
+
+
+
+#vix spike guard
+class VIXRiskModel(RiskManagementModel):
+    def __init__(self, algorithm, threshold=28.0, smooth=10):
+        vix = algorithm.add_index("VIX", Resolution.DAILY)
+        self._vix_ema = algorithm.ema(vix, smooth, Resolution.DAILY)
+        self._thresh  = threshold
+
+    def manage_risk(self, algorithm, targets):
+        if not self._vix_ema.is_ready:
+            return []
+        if self._vix_ema.current.value < self._thresh:
+            return []  # calm market → no action
+        targets = [PortfolioTarget(s, 0)
+                   for s in algorithm.active_securities.values()]
+        algorithm.insights.cancel([t.symbol for t in targets])
+        return targets
+
+# In main.py — stack both (LEAN unions their targets):
+self.add_risk_management(RiskModelWithSPY(self, spy, 200, Resolution.DAILY))
+self.add_risk_management(VIXRiskModel(self, threshold=28))
+
+
+#absolute momentum gate
+class AbsoluteMomentumRiskModel(RiskManagementModel):
+    def __init__(self, algorithm, spy, lookback=252,
+                 resolution=Resolution.DAILY):
+        self._spy_roc = algorithm.roc(spy, lookback, resolution)
+
+    def manage_risk(self, algorithm, targets):
+        if not self._spy_roc.is_ready:
+            return []
+        if self._spy_roc.current.value > 0:
+            return []  # SPY positive over 12 months → stay in
+        # 12-month return negative → full exit + insight cancel
+        targets = [PortfolioTarget(s, 0)
+                   for s in algorithm.active_securities.values()]
+        algorithm.insights.cancel([t.symbol for t in targets])
+        return targets
+
+# In main.py — three-layer defense stack:
+self.add_risk_management(AbsoluteMomentumRiskModel(self, spy))     # slow bear
+self.add_risk_management(RiskModelWithSPY(self, spy, 200, Resolution.DAILY))  # trend break
+self.add_risk_management(VIXRiskModel(self, threshold=28))         # panic spike
