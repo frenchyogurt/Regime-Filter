@@ -1,0 +1,542 @@
+# region imports
+from AlgorithmImports import *
+import numpy as np
+from collections import deque
+from sklearn.tree import DecisionTreeRegressor
+from sklearn.preprocessing import StandardScaler
+# endregion
+
+class MomentumBucketStrategy(QCAlgorithm):
+    """
+    Aggregated Momentum Bucket Strategy
+    ====================================
+    Combines five momentum sub-strategies into one unified framework:
+
+      1. SUE (Standardized Unexpected Earnings)
+         → Identifies earnings-momentum stocks via standardized EPS surprise.
+         → Provides the equity long-only sleeve.
+
+      2. Monte Carlo ETF Rotation
+         → Selects top-performing broad-market ETFs and allocates via minimum-
+           variance Monte Carlo simulation.
+         → Drives the ETF tactical sleeve.
+
+      3. Trend-Following with Multi-Horizon Momentum
+         → Scores ETFs on composite 1/3/6/12-month momentum and uses
+           inverse-volatility weighting.
+         → Refines ETF selection and sizing inside the ETF sleeve.
+
+      4. AI Macro-Driven Asset Rotation (Decision Tree on FRED factors)
+         → Uses VIX, yield-curve, and fed-funds rate to predict 21-day forward
+           returns for SPY, GLD, BND, and BTC.
+         → Sets top-level regime overlay and determines sleeve weights.
+
+      5. Momentum + Volatility Long-Short (Equity)
+         → From the large-cap universe, selects the most volatile stocks,
+           then goes long high-momentum and short low-momentum names.
+         → Adds a hedged, market-neutral equity layer.
+
+    Capital Allocation (dynamic, macro-regime driven):
+      • Equity Long Sleeve  (SUE stocks):      ~25%
+      • ETF Tactical Sleeve (Monte Carlo/Trend):~40%
+      • Long-Short Equity Sleeve:              ~20%
+      • Macro Asset Rotation (BTC/GLD/BND):   ~15%
+        (Exact weights shift based on AI model predictions each month.)
+    """
+
+    # ── Parameters ────────────────────────────────────────────────────────────
+    # SUE
+    _MONTHS_EPS_CHANGE  = 12
+    _MONTHS_COUNT       = 36
+    _NUM_SELECTED_SUE   = 1000
+    _TOP_PCT_SUE        = 0.05
+
+    # ETF universe
+    _ETF_TICKERS = [
+        'SPY', 'IWM', 'QQQ', 'EFA', 'EEM',
+        'VNQ', 'LQD', 'GLD', 'SHY', 'IEF', 'TLT', 'AGG',
+        'VTI', 'VXUS', 'BND',
+    ]
+    _ETF_TOP_N       = 5    # trend: pick top-N by composite score
+    _MC_TOP_N        = 4    # Monte Carlo: narrow to top-N by return first
+    _MC_PORTFOLIOS   = 200  # number of random MC portfolios
+    _VOL_WINDOW      = 20   # short-term vol window for MC covariance
+
+    # Long-short equity
+    _LS_LOOKBACK      = 20 * 6   # ~6 months of daily bars
+    _LS_NUM_SLICES    = 6        # 1/6 portfolio rotation cadence
+    _LS_VOLATILE_PCT  = 0.20
+    _LS_MOMENTUM_PCT  = 0.20
+
+    # Macro / AI
+    _FRED_TICKERS     = ['VIXCLS', 'T10Y3M', 'DFF']
+    _MAX_BTC_WEIGHT   = 0.10
+    _LOOKBACK_YEARS   = 4
+
+    # Sleeve allocation base weights (overridden by macro model output)
+    _BASE_ALLOC = {
+        'sue':   0.25,
+        'etf':   0.40,
+        'ls':    0.20,
+        'macro': 0.15,
+    }
+
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def initialize(self):
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+        self.set_cash(100_000)
+        self.settings.seed_initial_prices       = True
+        self.settings.daily_precise_end_time    = False
+
+        # ── SUE universe ──────────────────────────────────────────────────────
+        self._eps_by_symbol = {}
+        self._date_rule = self.date_rules.month_start('SPY')
+        self.universe_settings.schedule.on(self._date_rule)
+        self.universe_settings.resolution = Resolution.DAILY
+        self._sue_universe = self.add_universe(self._select_sue)
+
+        # ── ETFs ──────────────────────────────────────────────────────────────
+        self._etf_symbols = []
+        for ticker in self._ETF_TICKERS:
+            eq = self.add_equity(ticker, Resolution.DAILY)
+            # Multi-horizon momentum indicators (1, 3, 6, 12 months)
+            eq.momentum_indicators = [
+                self.momp(ticker, months * 21)
+                for months in [1, 3, 6, 12]
+            ]
+            # Realised-vol indicator (3-month rolling std of daily ROC)
+            eq.volatility = IndicatorExtensions.of(
+                StandardDeviation(3 * 21),
+                self.roc(ticker, 1)
+            )
+            self._etf_symbols.append(eq.symbol)
+
+        # ── Macro / AI assets ─────────────────────────────────────────────────
+        self._bitcoin  = self.add_crypto(
+            'BTCUSD', market=Market.BITFINEX, leverage=2
+        ).symbol
+        self._macro_equities = [
+            self.add_equity(t).symbol for t in ['SPY', 'GLD', 'BND']
+        ]
+        self._macro_assets = self._macro_equities + [self._bitcoin]
+        self._fred_symbols = [
+            self.add_data(Fred, t, Resolution.DAILY).symbol
+            for t in self._FRED_TICKERS
+        ]
+        self._ml_model  = DecisionTreeRegressor(max_depth=12, random_state=1)
+        self._ml_scaler = StandardScaler()
+
+        # ── Long-short equity universe ────────────────────────────────────────
+        self._ls_portfolios = deque(maxlen=self._LS_NUM_SLICES)
+        self._ls_universe   = self.add_universe(self._select_ls)
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self._sue_selected    = []
+        self._etf_weights     = {}
+        self._macro_weights   = {}
+        self._ls_weights      = {}
+        self._ls_windows      = {}   # symbol -> RollingWindow[TradeBar]
+
+        np.random.seed(42)
+
+        # ── Warm-up ───────────────────────────────────────────────────────────
+        warmup_days = max(
+            self._MONTHS_COUNT * 31 + 30,
+            400,
+            self._LS_LOOKBACK,
+            self._LOOKBACK_YEARS * 365,
+        )
+        self.set_warm_up(timedelta(warmup_days))
+
+    # ── Universe selectors ────────────────────────────────────────────────────
+
+    def _select_sue(self, fundamentals):
+        """SUE-based equity universe selection (Strategy 1)."""
+        selected = sorted(
+            [f for f in fundamentals
+             if f.price > 5 and f.earning_reports.basic_eps.three_months],
+            key=lambda f: f.dollar_volume
+        )[-self._NUM_SELECTED_SUE:]
+
+        sue_by_symbol = {}
+        for f in selected:
+            if f.symbol not in self._eps_by_symbol:
+                self._eps_by_symbol[f.symbol] = RollingWindow[float](self._MONTHS_COUNT)
+            window = self._eps_by_symbol[f.symbol]
+            window.add(f.earning_reports.basic_eps.three_months)
+            if not window.is_ready:
+                continue
+            eps_change = window[0] - window[self._MONTHS_EPS_CHANGE]
+            new_eps = list(window)[:self._MONTHS_COUNT - self._MONTHS_EPS_CHANGE:3]
+            old_eps = list(window)[self._MONTHS_EPS_CHANGE::3]
+            changes = [float(n - o) for n, o in zip(new_eps, old_eps)]
+            std = np.std(changes)
+            if std > 0:
+                sue_by_symbol[f.symbol] = eps_change / std
+
+        if not sue_by_symbol:
+            return []
+        n_long = max(1, int(self._TOP_PCT_SUE * len(sue_by_symbol)))
+        top = sorted(sue_by_symbol, key=lambda s: sue_by_symbol[s])[-n_long:]
+        self._sue_selected = top
+        return top
+
+    def _select_ls(self, fundamentals):
+        """Large-cap universe for long-short sleeve (Strategy 5)."""
+        filtered = [
+            f for f in fundamentals
+            if f.has_fundamental_data and f.price > 5 and not np.isnan(f.market_cap)
+        ]
+        filtered = sorted(filtered, key=lambda f: f.market_cap)[-int(len(filtered) / 2):]
+        return [f.symbol for f in filtered]
+
+    # ── Security event hooks ──────────────────────────────────────────────────
+
+    def on_securities_changed(self, changes):
+        """Warm up price history for new long-short universe members."""
+        for security in changes.added_securities:
+            if security.symbol in self._ls_universe.selected:
+                window = RollingWindow[TradeBar](self._LS_LOOKBACK)
+                for bar in self.history[TradeBar](security.symbol, self._LS_LOOKBACK):
+                    window.add(bar)
+                self._ls_windows[security.symbol] = window
+
+    # ── Scheduling ────────────────────────────────────────────────────────────
+
+    def on_warmup_finished(self):
+        time_rule = self.time_rules.after_market_open('SPY', 5)
+        self.schedule.on(self._date_rule, time_rule, self._rebalance)
+        if self.live_mode:
+            self._rebalance()
+        else:
+            self.schedule.on(self.date_rules.today, time_rule, self._rebalance)
+
+    # ── Master rebalance ──────────────────────────────────────────────────────
+
+    def _rebalance(self):
+        # Step 1 — compute sleeve weights from macro AI model
+        alloc = self._compute_macro_allocation()
+
+        # Step 2 — compute weights inside each sleeve
+        sue_w   = self._compute_sue_weights(alloc['sue'])
+        etf_w   = self._compute_etf_weights(alloc['etf'])
+        macro_w = self._compute_macro_weights(alloc['macro'])
+        ls_w    = self._compute_ls_weights(alloc['ls'])
+
+        # Step 3 — merge all targets (sue + etf + macro + ls)
+        merged: dict[Symbol, float] = {}
+        for d in [sue_w, etf_w, macro_w]:
+            for sym, wt in d.items():
+                merged[sym] = merged.get(sym, 0.0) + wt
+
+        # Long-short sleeve adds both long (+) and short (-) positions
+        for sym, wt in ls_w.items():
+            merged[sym] = merged.get(sym, 0.0) + wt
+
+        if not merged:
+            return
+
+        targets = [PortfolioTarget(sym, wt) for sym, wt in merged.items()]
+        self.set_holdings(targets, True)
+
+    # ── Sleeve: SUE equity longs (Strategy 1) ─────────────────────────────────
+
+    def _compute_sue_weights(self, sleeve_alloc: float) -> dict:
+        """Equal-weight the top-SUE stocks within the sleeve allocation."""
+        symbols = [
+            s for s in self._sue_selected
+            if s in self.securities and self.securities[s].price > 0
+        ]
+        if not symbols:
+            return {}
+        w = sleeve_alloc / len(symbols)
+        return {s: w for s in symbols}
+
+    # ── Sleeve: ETF tactical (Strategies 2 + 3 combined) ─────────────────────
+
+    def _compute_etf_weights(self, sleeve_alloc: float) -> dict:
+        """
+        1. Score ETFs by composite multi-horizon momentum (Strat 3).
+        2. Select top-N by score.
+        3. From those, further narrow to top-MC_TOP_N by 180-day return,
+           then find minimum-variance weights via Monte Carlo (Strat 2).
+        4. Fall back to inverse-volatility if Monte Carlo fails.
+        """
+        # Composite momentum scores
+        scored = {}
+        for sym in self._etf_symbols:
+            sec = self.securities.get(sym)
+            if sec is None:
+                continue
+            if (not hasattr(sec, 'momentum_indicators') or
+                    not hasattr(sec, 'volatility')):
+                continue
+            if (not all(ind.is_ready for ind in sec.momentum_indicators) or
+                    not sec.volatility.is_ready or
+                    sec.volatility.current.value == 0):
+                continue
+            score = sum(ind.current.value for ind in sec.momentum_indicators)
+            scored[sym] = (score, sec.volatility.current.value)
+
+        if len(scored) < self._ETF_TOP_N:
+            return {}
+
+        # Top-N by momentum score (Strat 3 selection)
+        top_trend = sorted(scored, key=lambda s: scored[s][0])[-self._ETF_TOP_N:]
+
+        # Try Monte Carlo minimum-variance on those (Strat 2 weighting)
+        history = self.history(top_trend, 180, Resolution.DAILY)
+        if not history.empty and 'close' in history.columns:
+            df = history['close'].unstack(level=0).dropna(axis=1)
+            mc_weights = self._monte_carlo_weights(df)
+            if mc_weights is not None and not mc_weights.empty:
+                total = mc_weights.sum()
+                if total > 0:
+                    return {sym: (wt / total) * sleeve_alloc
+                            for sym, wt in mc_weights.items()}
+
+        # Fallback: inverse-volatility weighting (Strat 3)
+        inv_vol_sum = sum(1.0 / scored[s][1] for s in top_trend)
+        return {
+            sym: (1.0 / scored[sym][1] / inv_vol_sum) * sleeve_alloc
+            for sym in top_trend
+        }
+
+    def _monte_carlo_weights(self, df: object):
+        """Monte Carlo minimum-variance optimizer (Strategy 2)."""
+        if df is None or df.empty or len(df) < self._VOL_WINDOW:
+            return None
+        # Further narrow to top-MC_TOP_N by period return
+        period_returns = np.log(df.iloc[-1] / df.iloc[0])
+        if len(period_returns) < self._MC_TOP_N:
+            return None
+        top_cols = list(period_returns.nlargest(self._MC_TOP_N).index)
+        returns = df[top_cols].pct_change().dropna()
+        if len(returns) < self._VOL_WINDOW:
+            return None
+        cov = returns[-self._VOL_WINDOW:].apply(lambda x: np.log(1 + x)).cov()
+        n = len(top_cols)
+        best_vol, best_w = np.inf, None
+        for _ in range(self._MC_PORTFOLIOS):
+            w = np.random.random(n)
+            w /= w.sum()
+            var = float(cov.mul(w, axis=0).mul(w, axis=1).sum().sum())
+            ann_vol = np.sqrt(var) * np.sqrt(252)
+            if ann_vol < best_vol:
+                best_vol, best_w = ann_vol, w
+        if best_w is None:
+            return None
+        return pd.Series(best_w, index=top_cols)
+
+    # ── Sleeve: Macro AI rotation (Strategy 4) ────────────────────────────────
+
+    def _compute_macro_weights(self, sleeve_alloc: float) -> dict:
+        """
+        Decision Tree trained on FRED macro factors predicts 21-day forward
+        returns for SPY, GLD, BND, BTC.  Proportional allocation to positively-
+        predicted assets, with BTC capped at _MAX_BTC_WEIGHT * sleeve_alloc.
+        """
+        lookback = timedelta(self._LOOKBACK_YEARS * 365)
+        try:
+            factors = self.history(
+                self._fred_symbols, lookback, Resolution.DAILY
+            )['value'].unstack(0).dropna()
+            labels = self.history(
+                self._macro_assets, lookback, Resolution.DAILY,
+                data_normalization_mode=DataNormalizationMode.TOTAL_RETURN
+            )['close'].unstack(0).dropna().pct_change(21).shift(-21).dropna()
+        except Exception:
+            return {}
+
+        if factors.empty or labels.empty:
+            return {}
+
+        predictions = {}
+        for sym in self._macro_assets:
+            if sym not in labels.columns:
+                continue
+            asset_labels = labels[sym].dropna()
+            idx = factors.index.intersection(asset_labels.index)
+            if len(idx) < 60:
+                continue
+            try:
+                self._ml_model.fit(
+                    self._ml_scaler.fit_transform(factors.loc[idx]),
+                    asset_labels.loc[idx]
+                )
+                pred = self._ml_model.predict(
+                    self._ml_scaler.transform([factors.iloc[-1]])
+                )[0]
+                if pred > 0:
+                    predictions[sym] = pred
+            except Exception:
+                continue
+
+        if not predictions:
+            return {}
+
+        total_pred = sum(predictions.values())
+        raw = {sym: (v / total_pred) * 1.5 * sleeve_alloc
+               for sym, v in predictions.items()}
+
+        # Cap BTC
+        btc_cap = self._MAX_BTC_WEIGHT * sleeve_alloc
+        if self._bitcoin in raw and raw[self._bitcoin] > btc_cap:
+            excess = raw[self._bitcoin] - btc_cap
+            raw[self._bitcoin] = btc_cap
+            eq_syms = [s for s in self._macro_equities if s in raw]
+            if eq_syms:
+                eq_total = sum(raw[s] for s in eq_syms)
+                if eq_total > 0:
+                    for s in eq_syms:
+                        raw[s] += excess * (raw[s] / eq_total)
+        return raw
+
+    # ── Sleeve: Long-short equity (Strategy 5) ────────────────────────────────
+
+    def _compute_ls_weights(self, sleeve_alloc: float) -> dict:
+        """
+        From the large-cap universe:
+          - Select the most volatile 20% (momentum-friendly stocks).
+          - Long top-20% by trailing return, short bottom-20%.
+          - Use a 1/6 rolling-replacement schedule.
+        Returns a dict of {symbol: signed_weight}.
+        """
+        securities = []
+        for sym in self._ls_universe.selected:
+            sec = self.securities.get(sym)
+            if sec is None:
+                continue
+            window = self._ls_windows.get(sym)
+            if window is not None and window.is_ready and sec.price > 0:
+                securities.append(sec)
+
+        if len(securities) < 100:
+            return {}
+
+        volatile = sorted(
+            securities, key=self._ls_volatility
+        )[-int(self._LS_VOLATILE_PCT * len(securities)):]
+
+        sorted_ret = sorted(volatile, key=self._ls_return)
+        n_long  = max(1, int(self._LS_MOMENTUM_PCT * len(sorted_ret)))
+        longs   = sorted_ret[-n_long:]
+        shorts  = sorted_ret[:n_long]
+
+        # Rotate out the oldest 1/6th
+        if len(self._ls_portfolios) == self._ls_portfolios.maxlen:
+            old_slice = list(self._ls_portfolios)[0]
+            for sec, qty in old_slice.items():
+                if sec.is_tradable and sec.price > 0:
+                    self.market_on_open_order(sec.symbol, -qty)
+
+        # Build this month's 1/6th slice
+        pv = self.portfolio.total_portfolio_value
+        slice_alloc = sleeve_alloc * pv / self._LS_NUM_SLICES
+        slice_portfolio = {}
+        weights = {}
+
+        for sec in longs:
+            qty = int(slice_alloc / 2 / len(longs) / sec.price)
+            if qty:
+                slice_portfolio[sec] = qty
+                weights[sec.symbol] = sleeve_alloc / 2 / len(longs)
+
+        for sec in shorts:
+            qty = -int(slice_alloc / 2 / len(shorts) / sec.price)
+            if qty:
+                slice_portfolio[sec] = qty
+                weights[sec.symbol] = -sleeve_alloc / 2 / len(shorts)
+
+        self._ls_portfolios.append(slice_portfolio)
+        for sec, qty in slice_portfolio.items():
+            self.market_on_open_order(sec.symbol, qty)
+
+        return weights
+
+    # ── Macro allocation router (Strategy 4 as regime overlay) ───────────────
+
+    def _compute_macro_allocation(self) -> dict:
+        """
+        Use the sign/magnitude of the Decision Tree predictions to tilt
+        sleeve allocations away from base weights.
+
+        High macro-model confidence → increase macro sleeve, reduce others.
+        Low confidence (few positive predictions) → revert to base weights.
+        """
+        lookback = timedelta(self._LOOKBACK_YEARS * 365)
+        try:
+            factors = self.history(
+                self._fred_symbols, lookback, Resolution.DAILY
+            )['value'].unstack(0).dropna()
+            labels = self.history(
+                self._macro_assets, lookback, Resolution.DAILY,
+                data_normalization_mode=DataNormalizationMode.TOTAL_RETURN
+            )['close'].unstack(0).dropna().pct_change(21).shift(-21).dropna()
+        except Exception:
+            return dict(self._BASE_ALLOC)
+
+        if factors.empty or labels.empty or len(factors) < 60:
+            return dict(self._BASE_ALLOC)
+
+        n_positive = 0
+        total_pred = 0.0
+        for sym in self._macro_assets:
+            if sym not in labels.columns:
+                continue
+            asset_labels = labels[sym].dropna()
+            idx = factors.index.intersection(asset_labels.index)
+            if len(idx) < 60:
+                continue
+            try:
+                self._ml_model.fit(
+                    self._ml_scaler.fit_transform(factors.loc[idx]),
+                    asset_labels.loc[idx]
+                )
+                pred = self._ml_model.predict(
+                    self._ml_scaler.transform([factors.iloc[-1]])
+                )[0]
+                if pred > 0:
+                    n_positive += 1
+                    total_pred += pred
+            except Exception:
+                continue
+
+        # Confidence: 0 to 1 based on fraction of assets with positive outlook
+        confidence = n_positive / max(len(self._macro_assets), 1)
+
+        # Tilt: high confidence boosts macro sleeve up to 25%, bleeds from ETF
+        macro_w = self._BASE_ALLOC['macro'] + confidence * 0.10
+        etf_w   = self._BASE_ALLOC['etf']   - confidence * 0.10
+        sue_w   = self._BASE_ALLOC['sue']
+        ls_w    = self._BASE_ALLOC['ls']
+
+        total = macro_w + etf_w + sue_w + ls_w
+        return {
+            'sue':   sue_w   / total,
+            'etf':   etf_w   / total,
+            'macro': macro_w / total,
+            'ls':    ls_w    / total,
+        }
+
+    # ── Long-short helper methods (Strategy 5) ────────────────────────────────
+
+    def _ls_history(self, security):
+        window = self._ls_windows.get(security.symbol)
+        if window is None:
+            return []
+        return [bar.close for bar in list(window)[::-1]][:-1]
+
+    def _ls_volatility(self, security):
+        prices = np.array(self._ls_history(security))[:-5]
+        if len(prices) < 2:
+            return 0.0
+        rets = np.diff(prices) / prices[:-1]
+        return np.std(rets) * np.sqrt(250 / max(len(rets), 1))
+
+    def _ls_return(self, security):
+        prices = np.array(self._ls_history(security))[:-5]
+        if len(prices) < 2:
+            return 0.0
+        return (prices[-1] - prices[0]) / prices[0]
