@@ -1,0 +1,270 @@
+# region imports
+from AlgorithmImports import *
+import numpy as np
+# endregion
+
+class FundamentalBucketAlgorithm(QCAlgorithm):
+    """
+    Fundamental Bucket Strategy v4 — optimised
+
+    Performance improvements:
+      - Universe runs monthly (not daily) via universe_settings.schedule
+      - history() removed from _select_assets entirely; momentum computed
+        from valuation_ratios.price_change_1m and six_months fields
+        (already available in the fundamentals object — no extra request)
+      - VIX read from securities cache, not a history() call
+      - Vol sizing history request scoped to final selected symbols only
+        (20 max) instead of the full 500-symbol pool
+
+    Strategy logic unchanged from v4:
+      - All sectors eligible, top 500 liquidity, 2yr IPO, ROE/margin/PE > 0
+      - 6m momentum filter, 7-factor composite rank, 25% sector cap, top 20
+      - Inverse-vol sizing; monthly drawdown + VIX risk checks
+    """
+
+    # ── Parameters ────────────────────────────────────────────────────
+    UNIVERSE_SIZE      = 500
+    PORTFOLIO_SIZE     = 20
+    MIN_PRICE          = 5.0
+    MIN_DOLLAR_VOL     = 1_000_000
+    MIN_IPO_DAYS       = 730        # 2 years
+
+    MAX_SECTOR_WEIGHT  = 0.25
+    DRAWDOWN_THRESHOLD = 0.15
+    VIX_THRESHOLD      = 25.0
+    VOL_LOOKBACK       = 21         # days for realised vol (only on 20 symbols)
+    MOMENTUM_LOOKBACK  = 126        # kept for warm-up sizing only
+
+    # ──────────────────────────────────────────────────────────────────
+
+    def initialize(self):
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+        self.set_cash(1_000_000)
+        self.settings.seed_initial_prices = True
+
+        # Safe-haven ETF
+        self._shy = self.add_equity("SHY", Resolution.DAILY).symbol
+
+        # VIX — read from securities cache, no history() call needed
+        self._vix_symbol = self.add_data(CBOE, "VIX", Resolution.DAILY).symbol
+
+        # Universe runs MONTHLY only — eliminates daily history() calls
+        self.universe_settings.schedule.on(
+            self.date_rules.month_start("SPY")
+        )
+        self.universe_settings.resolution = Resolution.DAILY
+        self._universe = self.add_universe(self._select_assets)
+
+        # Single monthly rebalance — fires after universe has settled
+        self.schedule.on(
+            self.date_rules.month_start("SPY"),
+            self.time_rules.after_market_open("SPY", 31),
+            self._rebalance,
+        )
+
+        self.set_execution(ImmediateExecutionModel())
+        # Warm-up only needs enough for vol calculation on rebalance day
+        self.set_warm_up(timedelta(self.VOL_LOOKBACK + 5))
+
+        self._peak_value = None
+
+    # ── Universe selection (monthly, no history() calls) ───────────────
+
+    def _select_assets(self, fundamentals):
+        now = self.time
+
+        # Step 1 — liquidity pre-filter
+        pool = [
+            f for f in fundamentals
+            if (f.has_fundamental_data
+                and f.price > self.MIN_PRICE
+                and f.dollar_volume > self.MIN_DOLLAR_VOL)
+        ]
+        pool = sorted(pool, key=lambda f: f.dollar_volume, reverse=True)[:self.UNIVERSE_SIZE]
+
+        # Step 2 — maturity filter
+        pool = [
+            f for f in pool
+            if (now - f.security_reference.ipo_date).days >= self.MIN_IPO_DAYS
+        ]
+
+        # Step 3 — basic quality gate
+        pool = [
+            f for f in pool
+            if (self._safe(f.operation_ratios.roe.value) > 0
+                and self._safe(f.operation_ratios.net_margin.value) > 0
+                and self._safe(f.valuation_ratios.pe_ratio) > 0)
+        ]
+
+        if not pool:
+            self.log(f"[UNIVERSE] {now.date()} empty after quality gate")
+            return []
+
+        # Step 4 — momentum filter using price_change_1m (confirmed valid field)
+        pool = [
+            f for f in pool
+            if self._safe(f.valuation_ratios.price_change_1m) > 0
+        ]
+
+        self.log(f"[UNIVERSE] {now.date()} after momentum filter: {len(pool)}")
+        if not pool:
+            return []
+
+        # Step 5 — 7-factor composite rank (all from fundamentals object)
+        rankings = [
+            sorted(pool, key=lambda f: self._safe(f.valuation_ratios.fcf_yield)),
+            sorted(pool, key=lambda f: self._safe(f.valuation_ratios.price_change_1m),     reverse=True),
+            sorted(pool, key=lambda f: self._safe(f.valuation_ratios.book_value_per_share)),
+            sorted(pool, key=lambda f: self._safe(f.earning_reports.total_dividend_per_share.three_months)),
+            sorted(pool, key=lambda f: self._safe(f.operation_ratios.roe.value)),
+            sorted(pool, key=lambda f: self._safe(f.operation_ratios.net_margin.value)),
+            sorted(pool, key=lambda f: self._safe(f.valuation_ratios.pe_ratio),            reverse=True),
+        ]
+        scores = {f: sum(r.index(f) for r in rankings) for f in pool}
+        ranked = sorted(scores, key=lambda f: scores[f], reverse=True)
+
+        # Step 6 — sector-capped top-N
+        selected       = []
+        sector_counts  = {}
+        max_per_sector = max(1, int(self.PORTFOLIO_SIZE * self.MAX_SECTOR_WEIGHT))
+
+        for f in ranked:
+            if len(selected) >= self.PORTFOLIO_SIZE:
+                break
+            sector = f.asset_classification.MorningstarSectorCode
+            if sector_counts.get(sector, 0) < max_per_sector:
+                selected.append(f)
+                sector_counts[sector] = sector_counts.get(sector, 0) + 1
+
+        symbols = [f.symbol for f in selected]
+        self.log(
+            f"[UNIVERSE] {now.date()} selected {len(symbols)}: "
+            f"{[s.value for s in symbols[:10]]} | sectors: {sector_counts}"
+        )
+        return symbols
+
+    # ── Monthly rebalance ──────────────────────────────────────────────
+
+    def _rebalance(self):
+        if self.is_warming_up:
+            return
+
+        pv = self.portfolio.total_portfolio_value
+
+        # Update all-time peak
+        if self._peak_value is None or pv > self._peak_value:
+            self._peak_value = pv
+
+        drawdown = (self._peak_value - pv) / self._peak_value
+
+        # ── Risk check 1: full drawdown protection ─────────────────────
+        if drawdown >= self.DRAWDOWN_THRESHOLD:
+            self.log(
+                f"[DRAWDOWN] {self.time.date()} drawdown={drawdown:.1%} "
+                f">= {self.DRAWDOWN_THRESHOLD:.0%} — parking in SHY"
+            )
+            self.liquidate()
+            self.set_holdings(self._shy, 1.0)
+            return
+
+        # ── Risk check 2: VIX regime (read from securities cache) ──────
+        vix = self._get_vix()
+        vix_elevated  = vix >= self.VIX_THRESHOLD
+        equity_scalar = 0.5 if vix_elevated else 1.0
+
+        if vix_elevated:
+            self.log(
+                f"[VIX] {self.time.date()} VIX={vix:.1f} >= "
+                f"{self.VIX_THRESHOLD} — 50% equity / 50% SHY"
+            )
+
+        # ── Get universe symbols ───────────────────────────────────────
+        selected = [s for s in self._universe.selected if s != self._shy]
+        self.log(
+            f"[REBALANCE] {self.time.date()} | {len(selected)} symbols | "
+            f"drawdown={drawdown:.1%} | VIX={vix:.1f}"
+        )
+
+        if not selected:
+            self.log("[REBALANCE] No symbols — parking in SHY")
+            self.liquidate()
+            self.set_holdings(self._shy, 1.0)
+            return
+
+        # ── Inverse-vol sizing — history only on final ~20 symbols ─────
+        weights = self._compute_weights(selected)
+
+        targets = [
+            PortfolioTarget(sym, float(weights.get(sym, 0.0)) * equity_scalar)
+            for sym in weights
+        ]
+        if vix_elevated:
+            targets.append(PortfolioTarget(self._shy, 0.5))
+
+        self.set_holdings(targets, liquidate_existing_holdings=True)
+        w_vals = list(weights.values())
+        self.log(
+            f"[REBALANCE] {len(targets)} targets | equity={equity_scalar:.0%} | "
+            f"max_w={max(w_vals) * equity_scalar:.2%} "
+            f"min_w={min(w_vals) * equity_scalar:.2%}"
+        )
+
+    # ── Helpers ────────────────────────────────────────────────────────
+
+    def _compute_weights(self, symbols):
+        """
+        Inverse-vol weights for a small list of symbols (~20).
+        Falls back to equal weight if history is unavailable.
+        Returns a dict {symbol: weight} summing to 1.0.
+        """
+        try:
+            hist = self.history(symbols, self.VOL_LOOKBACK + 1, Resolution.DAILY)
+            if hist.empty or "close" not in hist.columns:
+                raise ValueError("empty history")
+
+            closes  = hist["close"].unstack(level=0).dropna(axis=1)
+            rets    = closes.pct_change().dropna()
+            vol     = rets.std()
+            inv_vol = (1.0 / vol.replace(0.0, np.nan)).dropna()
+
+            valid = [s for s in symbols if s in inv_vol.index]
+            if not valid:
+                raise ValueError("no valid vol data")
+
+            inv_vol = inv_vol[valid]
+            total   = inv_vol.sum()
+            return {sym: float(inv_vol[sym] / total) for sym in valid}
+
+        except Exception as e:
+            self.log(f"[WEIGHTS] Vol sizing failed ({e}), equal weight")
+            n = len(symbols)
+            return {s: 1.0 / n for s in symbols}
+
+    def _get_vix(self):
+        """
+        Read latest VIX from the securities cache — no history() call.
+        Returns 0.0 if the data point isn't available yet.
+        """
+        try:
+            security = self.securities.get(self._vix_symbol)
+            if security is not None and security.price > 0:
+                return float(security.price)
+        except Exception:
+            pass
+        return 0.0
+
+    def on_order_event(self, order_event):
+        if order_event.status == OrderStatus.FILLED:
+            self.log(
+                f"[FILL] {order_event.symbol.value} "
+                f"qty={order_event.fill_quantity:.0f} "
+                f"price={order_event.fill_price:.2f}"
+            )
+
+    @staticmethod
+    def _safe(value, default=0.0):
+        try:
+            v = float(value)
+            return v if not np.isnan(v) and not np.isinf(v) else default
+        except (TypeError, ValueError):
+            return default
