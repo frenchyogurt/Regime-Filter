@@ -1,0 +1,338 @@
+# =============================================================================
+# AGGREGATED MEAN REVERSION STRATEGY
+# =============================================================================
+# Synthesises signals from five source strategies:
+#
+#   [1] DynamicNadionCircuit   — EMA-deviation long entry + 252-day high exit
+#   [2] HiddenMarkovModels     — Regime filter (HMM state) + z-score stationarity
+#   [3] LazyStrategy           — Worst-ROC contrarian country-ETF rotation
+#   [4] EquitiesStochAlpha     — Stochastic oscillator oversold entry
+#   [5] ConnorsCrash           — ConnorsRSI overbought + volatility short book
+# =============================================================================
+
+# region imports
+from AlgorithmImports import *
+from hmmlearn.hmm import GaussianHMM
+from statsmodels.tsa.stattools import adfuller
+import math
+# endregion
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INLINED HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fit_hmm(returns_1d: np.ndarray):
+    if len(returns_1d) < 50:
+        return None
+    try:
+        return GaussianHMM(
+            n_components=2, covariance_type="diag", n_iter=30, tol=1e-2
+        ).fit(returns_1d.reshape(-1, 1))
+    except Exception:
+        return None
+
+def _predict_state(model, price: float) -> int:
+    try:
+        return int(model.predict(np.array([[price]]))[0])
+    except Exception:
+        return 0
+
+def _z_score(series: np.ndarray) -> float:
+    std = series.std()
+    if std == 0:
+        return 0.0
+    return float((series[-1] - series.mean()) / std)
+
+
+# ── Country ETF tickers  [3] ──────────────────────────────────────────────────
+_COUNTRY_ETFS = [
+    "EWA", "EWO", "EWK", "EWZ", "EWC", "ECH", "GXC", "EWQ", "EWG", "EWH",
+    "PIN", "IDX", "EIRL", "EIS", "EWI", "EWM", "EWW", "EWN", "EPU", "EPOL",
+    "EWS", "EZA", "EWY", "EWP", "EWD", "EWL", "EWT", "THD", "TUR", "EWU",
+    "SPY", "VNM", "ENZL", "NORW", "EPHE", "QAT", "UAE", "GREK", "EWJ",
+    "KSA", "ARGT", "EDEN", "EFNL", "KWT",
+]
+
+
+class AggregatedMeanReversionAlgorithm(QCAlgorithm):
+
+    # ── Sleeve weights ────────────────────────────────────────────────────────
+    _LONG_BOOK_WEIGHT     = 0.45
+    _ROTATION_BOOK_WEIGHT = 0.20
+    _SHORT_BOOK_WEIGHT    = 0.35
+
+    # ── Long-book params  [1][2][4] ───────────────────────────────────────────
+    _EMA_PERIOD      = 100
+    _HIGH_PERIOD     = 252
+    _ZSCORE_ENTRY    = -1.0
+    _ZSCORE_EXIT     = 0.0
+    _STOCH_PERIOD    = 14
+    _STOCH_OVERSOLD  = 30
+    _MIN_SIGNALS     = 2
+
+    # ── Short-book params  [5] ────────────────────────────────────────────────
+    # No live universe — short book uses history() at rebalance time only.
+    # This eliminates daily indicator overhead for 200 securities.
+    _CRSI_PERIOD     = 14    # approximate via manual RSI on close prices
+    _CRSI_ENTRY      = 90
+    _CRSI_EXIT       = 30
+    _MAX_SHORTS      = 10    # reduced from 30 — fewer positions, less churn
+    _SHORT_LOOKBACK  = 20    # bars to compute short-book momentum/vol
+
+    # ── HMM states  [2] ───────────────────────────────────────────────────────
+    _REVERTING = 0
+    _TRENDING  = 1
+
+    def initialize(self):
+        self.set_start_date(self.end_date - timedelta(5 * 365))
+        self.set_cash(100_000)
+        self.settings.automatic_indicator_warm_up = True
+        self.settings.seed_initial_prices         = True
+        self.universe_settings.resolution         = Resolution.DAILY
+
+        # ── Long book: top-5 tech by market cap  [1] ──────────────────────────
+        self._long_universe = self.add_universe(self._select_long)
+
+        # ── Rotation book: country ETFs with ROC indicators  [3] ─────────────
+        self._rotation_etfs = []
+        for ticker in _COUNTRY_ETFS:
+            eq      = self.add_equity(ticker, Resolution.DAILY)
+            eq._roc = self.roc(eq, 252, Resolution.DAILY)
+            self._rotation_etfs.append(eq)
+        self._rotation_symbol = None
+
+        # ── Short book: small fixed watchlist of liquid ETFs  [5] ─────────────
+        # Instead of a dynamic universe (expensive), we short from a fixed
+        # list of sector/factor ETFs. Signals computed via history() monthly.
+        _SHORT_WATCHLIST = [
+            "XLK", "XLF", "XLE", "XLV", "XLI", "XLU", "XLP", "XLY",
+            "QQQ", "IWM", "EEM", "HYG", "GDX", "ARKK",
+        ]
+        self._short_symbols = []
+        for ticker in _SHORT_WATCHLIST:
+            sym = self.add_equity(ticker, Resolution.DAILY).symbol
+            self._short_symbols.append(sym)
+        self._active_shorts: set = set()
+
+        # ── State ─────────────────────────────────────────────────────────────
+        self._hmm_cache: dict = {}           # symbol -> fitted HMM model
+        self._stationarity_cache: dict = {}  # col -> bool, refreshed quarterly
+        self._stationarity_month: int = -1
+
+        self.set_warm_up(timedelta(300))
+
+        # Monthly rebalance — all books
+        self.schedule.on(
+            self.date_rules.month_start("SPY"),
+            self.time_rules.after_market_open("SPY", 30),
+            self._rebalance_all,
+        )
+        # Annual rotation  [3]
+        self.schedule.on(
+            self.date_rules.year_start("SPY"),
+            self.time_rules.after_market_open("SPY", 1),
+            self._rebalance_rotation,
+        )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # UNIVERSE SELECTION
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _select_long(self, fundamental):
+        """Top-5 tech stocks by market cap  [1]."""
+        tech = [
+            f for f in fundamental
+            if f.has_fundamental_data
+            and f.asset_classification.morningstar_sector_code
+                == MorningstarSectorCode.TECHNOLOGY
+        ]
+        return [f.symbol for f in sorted(tech, key=lambda f: f.market_cap)[-5:]]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SECURITY LIFECYCLE — long book only
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def on_securities_changed(self, changes):
+        for sec in changes.added_securities:
+            # Only attach heavy indicators to long-book stocks (max 5)
+            if sec.symbol in (self._long_universe.selected or set()):
+                sec._i_ema   = self.ema(sec, self._EMA_PERIOD)
+                sec._i_high  = self.max(sec, self._HIGH_PERIOD)
+                try:
+                    sec._i_stoch = self.sto(sec, self._STOCH_PERIOD)
+                except Exception:
+                    sec._i_stoch = None
+            else:
+                sec._i_ema   = None
+                sec._i_high  = None
+                sec._i_stoch = None
+
+        for sec in changes.removed_securities:
+            if sec.symbol in self._active_shorts:
+                self.liquidate(sec.symbol)
+                self._active_shorts.discard(sec.symbol)
+            elif (getattr(sec, "_i_ema", None) is not None and
+                  sec.holdings.invested):
+                self.liquidate(sec.symbol)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # MASTER MONTHLY REBALANCE
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _rebalance_all(self):
+        if self.is_warming_up:
+            return
+        self._manage_long_book()
+        self._manage_short_book()
+
+    # ── Long book  [1][2][4] ──────────────────────────────────────────────────
+
+    def _manage_long_book(self):
+        if not self._long_universe.selected:
+            return
+
+        symbols  = list(self._long_universe.selected)
+        n_slots  = max(len(symbols), 1)
+        per_pos  = self._LONG_BOOK_WEIGHT / n_slots
+
+        # Fetch one history call for all symbols at once
+        try:
+            hist = self.history(symbols, 63, Resolution.DAILY)
+            closes = hist["close"].unstack(level=0) if not hist.empty else pd.DataFrame()
+        except Exception:
+            closes = pd.DataFrame()
+
+        for symbol in symbols:
+            if symbol not in self.securities:
+                continue
+            sec = self.securities[symbol]
+            if sec._i_ema is None or not sec._i_ema.is_ready:
+                continue
+            if sec._i_high is None or not sec._i_high.is_ready:
+                continue
+
+            price    = sec.price
+            ema_val  = sec._i_ema.current.value
+            high_val = sec._i_high.current.value
+
+            # Z-score from pre-fetched history  [2]
+            z_score = None
+            col = next((c for c in closes.columns
+                        if str(c).upper() == str(symbol.value).upper()
+                        or c == symbol), None)
+            if col is not None and col in closes.columns:
+                series = closes[col].pct_change().dropna().values
+                if len(series) > 5:
+                    z_score = _z_score(series)
+
+            # HMM regime  [2]
+            hmm   = self._get_hmm(symbol, closes, col)
+            state = _predict_state(hmm, price) if hmm else self._REVERTING
+
+            # EXIT
+            if sec.holdings.is_long:
+                if (price >= high_val
+                        or (z_score is not None and z_score > self._ZSCORE_EXIT)
+                        or state == self._TRENDING):
+                    self.liquidate(symbol)
+                continue
+
+            # ENTRY
+            if state == self._TRENDING:
+                continue
+
+            sig_ema   = price < ema_val
+            sig_stoch = (sec._i_stoch is not None
+                         and sec._i_stoch.is_ready
+                         and sec._i_stoch.current.value < self._STOCH_OVERSOLD)
+            sig_z     = z_score is not None and z_score < self._ZSCORE_ENTRY
+
+            if sum([sig_ema, sig_stoch, sig_z]) >= self._MIN_SIGNALS:
+                self.set_holdings(symbol, per_pos)
+
+    def _get_hmm(self, symbol, closes: pd.DataFrame, col) -> object:
+        """Return cached HMM, fitting it lazily from pre-fetched closes."""
+        if symbol in self._hmm_cache:
+            return self._hmm_cache[symbol]
+        if col is None or closes.empty or col not in closes.columns:
+            return None
+        returns = closes[col].pct_change().dropna().values
+        model   = _fit_hmm(returns)
+        if model is not None:
+            self._hmm_cache[symbol] = model
+        return model
+
+    # ── Short book  [5] ───────────────────────────────────────────────────────
+
+    def _manage_short_book(self):
+        """
+        Compute overbought score from history() on a fixed ETF watchlist.
+        No live indicators attached — everything calculated at rebalance time.
+        """
+        try:
+            hist = self.history(self._short_symbols, 60, Resolution.DAILY)
+            if hist.empty:
+                return
+            closes = hist["close"].unstack(level=0).dropna()
+        except Exception:
+            return
+
+        # Score each symbol: high recent return + high vol = overbought candidate
+        scores = {}
+        for sym in self._short_symbols:
+            col = next((c for c in closes.columns
+                        if str(c).upper() == str(sym.value).upper()
+                        or c == sym), None)
+            if col is None or col not in closes.columns:
+                continue
+            prices  = closes[col].values
+            if len(prices) < 20:
+                continue
+            returns = np.diff(prices) / prices[:-1]
+            recent_ret = (prices[-1] - prices[-20]) / prices[-20]  # 1-month return
+            vol        = np.std(returns) * math.sqrt(252)
+            # Overbought = high return + high vol (mirrors ConnorsRSI logic  [5])
+            scores[sym] = recent_ret * vol
+
+        if not scores:
+            return
+
+        # Cover existing shorts that have reverted (return now negative)
+        for sym in list(self._active_shorts):
+            if sym in scores and scores[sym] < 0:
+                self.liquidate(sym)
+                self._active_shorts.discard(sym)
+
+        # Enter new shorts on most overbought symbols
+        available = self._MAX_SHORTS - len(self._active_shorts)
+        if available <= 0:
+            return
+
+        candidates = sorted(
+            [s for s in scores if scores[s] > 0.05 and s not in self._active_shorts],
+            key=lambda s: scores[s], reverse=True
+        )
+
+        target_weight = -(self._SHORT_BOOK_WEIGHT / self._MAX_SHORTS)
+        for sym in candidates[:available]:
+            if sym in self.securities and self.securities[sym].price > 0:
+                self.set_holdings(sym, target_weight)
+                self._active_shorts.add(sym)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ROTATION BOOK  [3]
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _rebalance_rotation(self):
+        ready = [e for e in self._rotation_etfs if e._roc.is_ready and e.price > 0]
+        if not ready:
+            return
+        worst = min(ready, key=lambda e: e._roc.current.value)
+        if self._rotation_symbol is not None and self._rotation_symbol != worst.symbol:
+            self.liquidate(self._rotation_symbol)
+        self._rotation_symbol = worst.symbol
+        self.set_holdings(worst.symbol, self._ROTATION_BOOK_WEIGHT)
+
+    def on_warmup_finished(self):
+        self._rebalance_rotation()
